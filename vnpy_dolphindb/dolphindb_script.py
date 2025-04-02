@@ -88,3 +88,37 @@ db.createPartitionedTable(
     sortColumns=["symbol", "exchange", "datetime"],
     keepDuplicates=LAST)
 """
+
+# 创建复权表
+CREATE_DR_TABLE_SCRIPT = f"""
+dataPath = "{DB_PATH}"
+db = database(dataPath)
+
+dr_columns = ["symbol", "exchange", "datetime", "ratio"]
+dr_type = [SYMBOL, SYMBOL, NANOTIMESTAMP, DOUBLE]
+dr = table(1:0, dr_columns, dr_type)
+
+db.createPartitionedTable(
+    dr,
+    "dr",
+    partitionColumns=["datetime"],
+    sortColumns=["symbol", "exchange", "datetime"],
+    keepDuplicates=LAST)
+"""
+
+
+# 创建复权overview表
+CREATE_DROVERVIEW_TABLE_SCRIPT = f"""
+dataPath = "{DB_PATH}"
+db = database(dataPath)
+
+overview_columns = ["symbol", "exchange", "count", "start", "end", "datetime"]
+overview_type = [SYMBOL, SYMBOL, INT, NANOTIMESTAMP, NANOTIMESTAMP, NANOTIMESTAMP]
+droverview = table(1:0, overview_columns, overview_type)
+db.createPartitionedTable(
+    droverview,
+    "droverview",
+    partitionColumns=["datetime"],
+    sortColumns=["symbol", "exchange", "datetime"],
+    keepDuplicates=LAST)
+"""

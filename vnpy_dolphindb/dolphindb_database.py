@@ -5,23 +5,27 @@ import pandas as pd
 import dolphindb as ddb
 import gc
 
-from vnpy.trader.constant import Exchange, Interval
-from vnpy.trader.object import BarData, TickData
+from vnpy.trader.constant import Exchange, Interval, Dividend
+from vnpy.trader.object import BarData, TickData, DividendData
 from vnpy.trader.database import (
     BaseDatabase,
     BarOverview,
     TickOverview,
+    DividendOverview,
     DB_TZ,
     convert_tz
 )
 from vnpy.trader.setting import SETTINGS
+from vnpy.trader.utility import make_front_back_dr, make_timetags_back_dr
 
 from .dolphindb_script import (
     CREATE_DATABASE_SCRIPT,
     CREATE_BAR_TABLE_SCRIPT,
     CREATE_TICK_TABLE_SCRIPT,
     CREATE_BAROVERVIEW_TABLE_SCRIPT,
-    CREATE_TICKOVERVIEW_TABLE_SCRIPT
+    CREATE_TICKOVERVIEW_TABLE_SCRIPT,
+    CREATE_DR_TABLE_SCRIPT,
+    CREATE_DROVERVIEW_TABLE_SCRIPT,
 )
 
 
@@ -50,6 +54,13 @@ class DolphindbDatabase(BaseDatabase):
             self.session.run(CREATE_TICK_TABLE_SCRIPT)
             self.session.run(CREATE_BAROVERVIEW_TABLE_SCRIPT)
             self.session.run(CREATE_TICKOVERVIEW_TABLE_SCRIPT)
+            self.session.run(CREATE_DR_TABLE_SCRIPT)
+            self.session.run(CREATE_DROVERVIEW_TABLE_SCRIPT)
+
+        if not self.session.existsTable(self.db_path, 'dr'):
+            # 老数据库没有除权表
+            self.session.run(CREATE_DR_TABLE_SCRIPT)
+            self.session.run(CREATE_DROVERVIEW_TABLE_SCRIPT)
 
     def __del__(self) -> None:
         """析构函数"""
@@ -283,7 +294,8 @@ class DolphindbDatabase(BaseDatabase):
         exchange: Exchange,
         interval: Interval,
         start: datetime,
-        end: datetime
+        end: datetime,
+        dividend: Dividend=Dividend.NONE,
     ) -> list[BarData]:
         """读取K线数据"""
         # 转换时间格式
@@ -307,6 +319,9 @@ class DolphindbDatabase(BaseDatabase):
 
         if df.empty:
             return []
+
+        # if dividend != Dividend.NONE:
+        #     self._apply_dividend('bar', df, symbol, exchange, dividend)
 
         df.set_index("datetime", inplace=True)
         df = df.tz_localize(DB_TZ.key)
@@ -338,7 +353,8 @@ class DolphindbDatabase(BaseDatabase):
         symbol: str,
         exchange: Exchange,
         start: datetime,
-        end: datetime
+        end: datetime,
+        dividend: Dividend,
     ) -> list[TickData]:
         """读取Tick数据"""
         # 转换时间格式
@@ -362,6 +378,9 @@ class DolphindbDatabase(BaseDatabase):
 
         if df.empty:
             return []
+
+        if dividend != Dividend.NONE:
+            self._apply_dividend('tick', df, symbol, exchange, dividend)
 
         df.set_index("datetime", inplace=True)
         df = df.tz_localize(DB_TZ.key)
@@ -529,3 +548,236 @@ class DolphindbDatabase(BaseDatabase):
             overviews.append(overview)
 
         return overviews
+
+    # ---------------------------------------------------------------------------------------------
+
+    def save_dividend_data(self, drs: list[DividendData]) -> bool:
+        """保存除权数据"""
+        # 读取主键参数
+        dr: DividendData = drs[0]
+        symbol: str = dr.symbol
+        exchange: Exchange = dr.exchange
+
+        # 转换为DatFrame写入数据库
+        data: list[dict] = []
+
+        for dr in drs:
+            dt: np.datetime64 = np.datetime64(convert_tz(dr.datetime))
+
+            d: dict = {
+                "symbol": symbol,
+                "exchange": exchange.value,
+                "datetime": dt,
+                "ratio": float(dr.ratio),
+            }
+
+            data.append(d)
+
+        df: pd.DataFrame = pd.DataFrame.from_records(data)
+        del data
+        gc.collect()
+
+        appender: ddb.PartitionedTableAppender = ddb.PartitionedTableAppender(self.db_path, "dr", "datetime", self.pool)
+        appender.append(df)
+
+        # 计算已有除权数据的汇总
+        overview_table = self.session.loadTable(tableName="droverview", dbPath=self.db_path)
+        overview: pd.DataFrame = (
+            overview_table.select('*')
+            .where(f'symbol="{symbol}"')
+            .where(f'exchange="{exchange.value}"')
+            .toDF()
+        )
+
+        begin_dt: datetime = np.datetime64(convert_tz(drs[0].datetime))
+        end_dt: datetime = np.datetime64(convert_tz(drs[-1].datetime))
+
+        if overview.empty:
+            start: datetime = begin_dt
+            end: datetime = end_dt
+            count: int = len(drs)
+        else:
+            start: datetime = min(begin_dt, overview["start"][0])
+            end: datetime = max(end_dt, overview["end"][0])
+
+            table = self.session.loadTable(tableName="dr", dbPath=self.db_path)
+
+            df_count: pd.DataFrame = (
+                table.select('count(*)')
+                .where(f'symbol="{symbol}"')
+                .where(f'exchange="{exchange.value}"')
+                .toDF()
+            )
+
+            count: int = df_count["count"][0]
+
+        # 更新汇总数据
+        data: list[dict] = []
+
+        dt: np.datetime64 = np.datetime64(datetime(2022, 1, 1))    # 该时间戳仅用于分区
+
+        d: dict = {
+            "symbol": symbol,
+            "exchange": exchange.value,
+            "count": count,
+            "start": start,
+            "end": end,
+            "datetime": dt,
+        }
+        data.append(d)
+
+        df: pd.DataFrame = pd.DataFrame.from_records(data)
+
+        appender: ddb.PartitionedTableAppender = ddb.PartitionedTableAppender(self.db_path, "droverview", "datetime", self.pool)
+        appender.append(df)
+
+        return True
+
+    def _load_dividend_data(
+        self,
+        symbol: str,
+        exchange: Exchange,
+        start: datetime,
+        end: datetime
+    ) -> pd.DataFrame:
+        start = np.datetime64(start)
+        start: str = str(start).replace("-", ".")
+
+        end = np.datetime64(end)
+        end: str = str(end).replace("-", ".")
+
+        table: ddb.Table = self.session.loadTable(tableName="dr", dbPath=self.db_path)
+        df: pd.DataFrame = (
+            table.select('*')
+            .where(f'symbol="{symbol}"')
+            .where(f'exchange="{exchange.value}"')
+            .where(f'datetime>={start}')
+            .where(f'datetime<={end}')
+            .toDF()
+        )
+        return df
+
+    def load_dividend_data(
+        self,
+        symbol: str,
+        exchange: Exchange,
+        start: datetime,
+        end: datetime
+    ) -> list[DividendData]:
+        """"查询数据库中的复权汇总信息"""
+        df = self._load_dividend_data(symbol, exchange, start, end)
+
+        out_data: list[DividendData] = []
+
+        for tp in df.itertuples():
+            data: DividendData = DividendData(
+                symbol=tp.symbol,
+                exchange=Exchange(tp.exchange),
+                datetime=tp.datetime,
+                ratio=tp.ratio,
+                gateway_name="DB",
+            )
+            out_data.append(data)
+
+        return out_data
+
+    def get_dividend_overview(
+        self,
+        symbol: str=None,
+        exchange: Exchange=None,
+    ) -> list[DividendOverview]:
+        """"查询数据库中的除权汇总信息"""
+        table: ddb.Table = self.session.loadTable(tableName="droverview", dbPath=self.db_path)
+
+        if symbol is None:
+            df: pd.DataFrame = table.select('*').toDF()
+        else:
+            df: pd.DataFrame = (
+                table.select('*')
+                .where(f'symbol="{symbol}"')
+                .where(f'exchange="{exchange.value}"')
+                .toDF()
+            )
+
+        overviews: list[DividendOverview] = []
+
+        for tp in df.itertuples():
+            overview: DividendOverview = DividendOverview(
+                symbol=tp.symbol,
+                exchange=Exchange(tp.exchange),
+                count=tp.count,
+                start=datetime.fromtimestamp(tp.start.to_pydatetime().timestamp(), DB_TZ),
+                end=datetime.fromtimestamp(tp.end.to_pydatetime().timestamp(), DB_TZ),
+            )
+            overviews.append(overview)
+
+        return overviews
+
+    def delete_dividend_data(
+        self,
+        symbol: str,
+        exchange: Exchange
+    ) -> int:
+        """删除除权数据"""
+        # 加载数据表
+        table: ddb.Table = self.session.loadTable(tableName="dr", dbPath=self.db_path)
+
+        # 统计数据量
+        df: pd.DataFrame = (
+            table.select('count(*)')
+            .where(f'symbol="{symbol}"')
+            .where(f'exchange="{exchange.value}"')
+            .toDF()
+        )
+        count: int = df["count"][0]
+
+        # 删除数据
+        (
+            table.delete()
+            .where(f'symbol="{symbol}"')
+            .where(f'exchange="{exchange.value}"')
+            .execute()
+        )
+
+        # 删除汇总
+        table: ddb.Table = self.session.loadTable(tableName="droverview", dbPath=self.db_path)
+        (
+            table.delete()
+            .where(f'symbol="{symbol}"')
+            .where(f'exchange="{exchange.value}"')
+            .execute()
+        )
+
+        return count
+
+    def _apply_dividend(self, type, df, symbol, exchange, dividend):
+        assert dividend in [Dividend.FRONT_RATIO, Dividend.BACK_RATIO]
+        assert type in ['tick', 'bar']
+
+        dividend_df = self._load_dividend_data(symbol, exchange, datetime(1970, 1, 1), datetime(2200, 1, 1))
+        if len(dividend_df) == 0:
+            return
+
+        _, back_dr = make_front_back_dr(dividend_df['ratio'].to_numpy(np.float64))
+
+        dividend_time = dividend_df['datetime'].to_numpy(np.int64)
+        df_time = df['datetime'].to_numpy(np.int64)
+
+        df_back_dr = make_timetags_back_dr(df_time, dividend_time, back_dr)
+        if dividend == Dividend.FRONT_RATIO:
+            df_back_dr /= df_back_dr[-1]
+
+        if type == 'tick':
+            col_names = ["last_price", "limit_up", "limit_down",
+                "open_price", "high_price", "low_price", "pre_close",
+                "bid_price_1", "bid_price_2", "bid_price_3", "bid_price_4", "bid_price_5",
+                "ask_price_1", "ask_price_2", "ask_price_3", "ask_price_4", "ask_price_5",
+                "bid_volume_1", "bid_volume_2", "bid_volume_3", "bid_volume_4", "bid_volume_5",
+                "ask_volume_1", "ask_volume_2", "ask_volume_3", "ask_volume_4", "ask_volume_5"]
+            for name in col_names:
+                df[name] *= df_back_dr
+
+        elif type == 'bar':
+            col_names = ["open_price", "high_price", "low_price", "close_price"]
+            for name in col_names:
+                df[name] *= df_back_dr
